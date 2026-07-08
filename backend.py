@@ -144,7 +144,7 @@ def analyze_image(image_path, mode_key, profile):
 
     response = client.models.generate_content(
 
-        model="gemini-2.5-flash",
+        model="gemini-2.0-flash",
 
         contents=[
 
