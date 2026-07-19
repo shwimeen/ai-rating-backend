@@ -1,5 +1,7 @@
 import os
 import json
+import time
+
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, UploadFile, File, Form
@@ -7,14 +9,29 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError, ServerError
 
 
 load_dotenv()
 
+
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-client = genai.Client(api_key=GEMINI_KEY)
+client = genai.Client(
+    api_key=GEMINI_KEY
+)
 
+
+# ==========================
+# МОДЕЛЬ GEMINI
+# ==========================
+
+MODEL_NAME = "gemini-2.5-flash-lite"
+
+
+# ==========================
+# FASTAPI
+# ==========================
 
 app = FastAPI()
 
@@ -28,61 +45,90 @@ app.add_middleware(
 )
 
 
+# ==========================
+# РЕЖИМЫ
+# ==========================
+
 MODES = {
-    "male": "мужской образ (лицо, стиль, ухоженность)",
-    "female": "женский образ (лицо, стиль, макияж)",
-    "general": "общая привлекательность без привязки к полу",
+
+    "male":
+        "мужской образ (лицо, стиль, ухоженность)",
+
+    "female":
+        "женский образ (лицо, стиль, макияж)",
+
+    "general":
+        "общая привлекательность без привязки к полу",
+
 }
 
 
+# ==========================
+# JSON СХЕМА
+# ==========================
+
 RESPONSE_SCHEMA = {
+
     "type": "object",
+
     "properties": {
 
         "face_visible": {
-            "type": "boolean",
-            "description": "Виден ли на фото человек и лицо достаточно хорошо для оценки"
+            "type": "boolean"
         },
 
         "rating": {
-            "type": "number",
-            "description": "Оценка от 1.0 до 10.0 с одной цифрой после запятой. Например 7.3 или 8.5. Если лицо не видно — 0"
+            "type": "number"
         },
 
         "strengths": {
+
             "type": "array",
+
             "items": {
                 "type": "string"
-            },
-            "description": "1-3 сильные стороны внешности"
+            }
+
         },
 
         "advice": {
+
             "type": "array",
+
             "items": {
                 "type": "string"
-            },
-            "description": "1-3 коротких совета по улучшению"
+            }
+
         },
 
         "summary": {
-            "type": "string",
-            "description": "Короткий итоговый комментарий"
+            "type": "string"
         }
+
     },
 
+
     "required": [
+
         "face_visible",
         "rating",
         "strengths",
         "advice",
         "summary"
+
     ]
+
 }
 
 
 
+# ==========================
+# GEMINI ANALYSIS
+# ==========================
+
+
 def analyze_image(image_path, mode_key, profile):
+
 
     mode_desc = MODES.get(
         mode_key,
@@ -117,10 +163,12 @@ def analyze_image(image_path, mode_key, profile):
 
 
         if parts:
+
             profile_line = (
                 "Дополнительный контекст: "
                 + ", ".join(parts)
             )
+
 
 
     prompt = (
@@ -133,49 +181,86 @@ def analyze_image(image_path, mode_key, profile):
 
         "Дай реалистичную оценку от 1.0 до 10.0. "
 
-        "Используй десятичные значения с одной цифрой после запятой, "
-        "например 6.8, 7.3, 8.9. "
+        "Используй одну цифру после запятой. "
 
-        "Не округляй оценку до целого числа. "
+        "Например 7.3 или 8.5. "
 
         "Оцени только то, что видно на фотографии."
+
     )
 
 
-    response = client.models.generate_content(
 
-        model="gemini-2.5-flash-lite",
+    with open(image_path, "rb") as image:
 
-        contents=[
 
-            prompt,
+        response = client.models.generate_content(
 
-            types.Part.from_bytes(
+            model=MODEL_NAME,
 
-                data=open(image_path, "rb").read(),
 
-                mime_type="image/jpeg"
+            contents=[
+
+                prompt,
+
+
+                types.Part.from_bytes(
+
+                    data=image.read(),
+
+                    mime_type="image/jpeg"
+
+                )
+
+            ],
+
+
+            config=types.GenerateContentConfig(
+
+                response_mime_type="application/json",
+
+                response_schema=RESPONSE_SCHEMA
 
             )
-        ],
-
-        config=types.GenerateContentConfig(
-
-            response_mime_type="application/json",
-
-            response_schema=RESPONSE_SCHEMA,
 
         )
-    )
 
 
-    return json.loads(response.text)
+    try:
+
+        return json.loads(
+            response.text
+        )
 
 
+    except Exception as e:
+
+        print(
+            "JSON ERROR:",
+            e
+        )
+
+        return {
+
+            "error": True,
+
+            "message":
+            "⚠️ AI вернул некорректный ответ."
+
+        }
+
+
+
+
+
+# ==========================
+# API
+# ==========================
 
 
 @app.post("/analyze")
 async def analyze(
+
 
     photo: UploadFile = File(...),
 
@@ -185,12 +270,13 @@ async def analyze(
 
     height: str = Form(None),
 
-    weight: str = Form(None),
+    weight: str = Form(None)
 
 ):
 
 
     temp_file = "temp_photo.jpg"
+
 
 
     with open(temp_file, "wb") as f:
@@ -200,34 +286,133 @@ async def analyze(
         )
 
 
+
     profile = {
+
 
         "age": age,
 
         "height": height,
 
-        "weight": weight,
+        "weight": weight
 
     }
 
 
+
     try:
 
-        result = analyze_image(
 
-            temp_file,
-
-            mode,
-
-            profile
-
-        )
+        for attempt in range(3):
 
 
-        return result
+            try:
+
+
+                print(
+                    f"Gemini попытка {attempt + 1}/3"
+                )
+
+
+                result = analyze_image(
+
+                    temp_file,
+
+                    mode,
+
+                    profile
+
+                )
+
+
+                print(
+                    "Анализ успешный"
+                )
+
+
+                return result
+
+
+
+            except ServerError as e:
+
+
+                print(
+                    "Gemini 503:",
+                    e
+                )
+
+
+                if attempt < 2:
+
+
+                    print(
+                        "Повтор через 3 секунды..."
+                    )
+
+
+                    time.sleep(3)
+
+
+
+                else:
+
+
+                    return {
+
+                        "error": True,
+
+                        "message":
+                        "⚠️ AI перегружен. Попробуйте позже."
+
+                    }
+
+
+
+
+            except ClientError as e:
+
+
+                print(
+                    "Gemini API ошибка:",
+                    e
+                )
+
+
+                return {
+
+                    "error": True,
+
+                    "message":
+                    "⚠️ Лимит AI запросов закончился."
+
+                }
+
+
+
+
+            except Exception as e:
+
+
+                print(
+                    "Ошибка анализа:",
+                    e
+                )
+
+
+                return {
+
+                    "error": True,
+
+                    "message":
+                    "⚠️ Ошибка обработки изображения."
+
+                }
+
 
 
     finally:
+
 
         if os.path.exists(temp_file):
 
@@ -236,9 +421,18 @@ async def analyze(
 
 
 
+# ==========================
+# CHECK SERVER
+# ==========================
+
+
 @app.get("/")
 def root():
 
     return {
-        "status": "ok"
+
+        "status": "ok",
+
+        "model": MODEL_NAME
+
     }
