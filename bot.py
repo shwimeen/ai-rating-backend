@@ -1,4 +1,31 @@
 import os
+import threading
+import uvicorn
+from fastapi import FastAPI
+
+
+web_app = FastAPI()
+
+
+@web_app.get("/")
+def home():
+    return {
+        "status": "bot running"
+    }
+
+
+def run_web():
+    uvicorn.run(
+        web_app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
+
+
+threading.Thread(
+    target=run_web,
+    daemon=True
+).start()
 
 from dotenv import load_dotenv
 
