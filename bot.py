@@ -1,8 +1,5 @@
 import os
-import threading
-import uvicorn
 
-from fastapi import FastAPI
 from dotenv import load_dotenv
 
 from telegram import (
@@ -20,34 +17,8 @@ from telegram.ext import (
 )
 
 
-# -------------------------
-# Render Web Server
-# -------------------------
-
-web_app = FastAPI()
-
-
-@web_app.get("/")
-def home():
-    return {"status": "bot is running"}
-
-
-def run_web():
-    uvicorn.run(
-        web_app,
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
-    )
-
-
-threading.Thread(target=run_web, daemon=True).start()
-
-
-# -------------------------
-# Telegram Bot
-# -------------------------
-
 load_dotenv()
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -75,27 +46,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
 
     await application.bot.set_my_commands([
-        BotCommand("start", "Открыть приложение")
+        BotCommand(
+            "start",
+            "Открыть приложение"
+        )
     ])
 
 
 def main():
 
-    bot_app = (
+    app = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
         .build()
     )
 
-    bot_app.add_handler(
+
+    app.add_handler(
         CommandHandler("start", start)
     )
 
+
     print("Bot started 🚀")
 
-    bot_app.run_polling()
+
+    app.run_polling(
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
-    main()  
+    main()
