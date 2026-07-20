@@ -4,4 +4,4 @@ python-multipart
 python-dotenv
 google-genai
 python-telegram-bot
-libsql-experimental
+libsql-client
