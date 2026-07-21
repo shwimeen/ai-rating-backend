@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import sqlite3
 import urllib.parse
+import urllib.request
 from datetime import date, datetime, timedelta
 
 from dotenv import load_dotenv
@@ -25,6 +26,37 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")  # тот же токен, что и в bot.p
 client = genai.Client(api_key=GEMINI_KEY)
 
 MODEL_NAME = "gemini-2.5-flash-lite"
+
+# ==========================
+# ОПЛАТА (Telegram Stars)
+# ==========================
+#
+# 1 анализ — бесплатно (пробный). Дальше нужны кредиты, покупаются за Stars
+# (встроенная валюта Telegram — платёжный провайдер не нужен, currency="XTR").
+# Поменяй здесь цены/пакеты под себя.
+
+TELEGRAM_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
+
+STAR_PACKAGES = {
+    "small": {
+        "credits": 5,
+        "stars": 99,
+        "title": "5 анализов",
+        "description": "5 дополнительных AI-анализов внешности",
+    },
+    "medium": {
+        "credits": 15,
+        "stars": 249,
+        "title": "15 анализов",
+        "description": "15 анализов — выгоднее, чем по одному",
+    },
+    "large": {
+        "credits": 50,
+        "stars": 699,
+        "title": "50 анализов",
+        "description": "50 анализов — максимальная выгода",
+    },
+}
 
 
 # ==========================
@@ -99,6 +131,23 @@ def init_db():
         """
     )
 
+    # Миграция для баз, созданных до введения оплаты: добавляем колонки,
+    # если их ещё нет (ALTER TABLE ADD COLUMN упадёт с ошибкой, если колонка
+    # уже существует — это ожидаемо и безопасно игнорируется).
+    for alter_sql in (
+        "ALTER TABLE users ADD COLUMN credits INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN free_used INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            conn.execute(alter_sql)
+            conn.commit()
+        except Exception:
+            pass
+
+    # Пользователям, которые уже что-то анализировали ДО введения оплаты,
+    # считаем пробную попытку использованной — иначе они получат ещё одну
+    # бесплатную сверх положенной. Выполняется ниже, после создания analyses.
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS analyses (
@@ -128,7 +177,36 @@ def init_db():
         """
     )
 
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            charge_id TEXT NOT NULL UNIQUE,
+            package TEXT,
+            stars INTEGER,
+            credits INTEGER,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_analyses_user ON analyses(telegram_id)")
+
+    # Теперь, когда analyses точно существует: пользователям, которые уже
+    # что-то анализировали ДО введения оплаты, считаем пробную попытку
+    # использованной — иначе они получат ещё одну бесплатную сверх положенной.
+    try:
+        conn.execute(
+            """
+            UPDATE users SET free_used = 1
+            WHERE free_used = 0
+              AND telegram_id IN (SELECT DISTINCT telegram_id FROM analyses)
+            """
+        )
+        conn.commit()
+    except Exception:
+        pass
 
     conn.commit()
     _close(conn)
@@ -211,7 +289,7 @@ def get_or_create_user(user_info):
 
     cur = conn.execute(
         "SELECT telegram_id, username, first_name, photo_url, "
-        "leaderboard_opt_in, referred_by, referral_count "
+        "leaderboard_opt_in, referred_by, referral_count, credits, free_used "
         "FROM users WHERE telegram_id = ?",
         (user_info["id"],),
     )
@@ -234,6 +312,7 @@ def get_or_create_user(user_info):
         conn.commit()
 
         leaderboard_opt_in, referred_by, referral_count = 1, None, 0
+        credits, free_used = 0, 0
     else:
         conn.execute(
             "UPDATE users SET username = ?, first_name = ?, photo_url = ? "
@@ -248,6 +327,7 @@ def get_or_create_user(user_info):
         conn.commit()
 
         leaderboard_opt_in, referred_by, referral_count = row[4], row[5], row[6]
+        credits, free_used = row[7], row[8]
 
     _close(conn)
 
@@ -259,7 +339,50 @@ def get_or_create_user(user_info):
         "leaderboard_opt_in": leaderboard_opt_in,
         "referred_by": referred_by,
         "referral_count": referral_count,
+        "credits": credits,
+        "free_used": free_used,
     }
+
+
+# ==========================
+# ДОСТУП К АНАЛИЗУ (пробная попытка + кредиты)
+# ==========================
+
+def get_access_status(telegram_id):
+    """
+    Только проверяет, есть ли доступ, НИЧЕГО не списывает.
+    Возвращает (allowed: bool, reason: "free" | "credit" | "none").
+    """
+    conn = get_conn()
+    cur = conn.execute(
+        "SELECT free_used, credits FROM users WHERE telegram_id = ?", (telegram_id,)
+    )
+    row = cur.fetchone()
+    _close(conn)
+
+    free_used, credits = (row[0], row[1]) if row else (0, 0)
+
+    if not free_used:
+        return True, "free"
+    if credits and credits > 0:
+        return True, "credit"
+    return False, "none"
+
+
+def consume_access(telegram_id, reason):
+    """Списывает пробную попытку или один кредит. Вызывать ТОЛЬКО после успешного анализа."""
+    conn = get_conn()
+
+    if reason == "free":
+        conn.execute("UPDATE users SET free_used = 1 WHERE telegram_id = ?", (telegram_id,))
+    elif reason == "credit":
+        conn.execute(
+            "UPDATE users SET credits = credits - 1 WHERE telegram_id = ? AND credits > 0",
+            (telegram_id,),
+        )
+
+    conn.commit()
+    _close(conn)
 
 
 # ==========================
@@ -378,6 +501,14 @@ def get_all_badges(telegram_id):
         {"id": b["id"], "emoji": b["emoji"], "name": b["name"], "earned": b["id"] in earned_ids}
         for b in BADGES
     ]
+
+
+def get_credits(telegram_id):
+    conn = get_conn()
+    cur = conn.execute("SELECT credits FROM users WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+    _close(conn)
+    return row[0] if row else 0
 
 
 # ==========================
@@ -515,6 +646,26 @@ async def analyze(
     weight: str = Form(None),
     init_data: str = Form(None),
 ):
+    # Оплата привязана к Telegram-аккаунту, поэтому авторизация теперь
+    # обязательна — без неё нельзя ни посчитать пробную попытку, ни списать
+    # кредит. Открывать мини-апп нужно через Telegram.
+    user_info = verify_init_data(init_data) if init_data else None
+
+    if not user_info:
+        return {
+            "error": True,
+            "message": "⚠️ Открой приложение через Telegram, чтобы им пользоваться.",
+        }
+
+    user = get_or_create_user(user_info)
+
+    allowed, reason = get_access_status(user["telegram_id"])
+    if not allowed:
+        return {
+            "error": True,
+            "need_payment": True,
+            "message": "🔒 Бесплатная попытка уже использована. Пополни баланс, чтобы продолжить.",
+        }
 
     temp_file = f"temp_{int(time.time() * 1000)}.jpg"
 
@@ -559,44 +710,44 @@ async def analyze(
                 }
 
         if result is None or result.get("error"):
+            # Неудачная попытка (например, лицо не найдено) — доступ НЕ списываем.
             return result
 
-        # Если пользователь авторизован через Telegram — сохраняем в историю
-        user_info = verify_init_data(init_data) if init_data else None
+        # Успех — теперь можно списать пробную попытку/кредит и сохранить историю.
+        consume_access(user["telegram_id"], reason)
 
-        if user_info:
-            user = get_or_create_user(user_info)
+        conn = get_conn()
+        conn.execute(
+            """
+            INSERT INTO analyses
+                (telegram_id, mode, rating, style_score, vibe, potential,
+                 summary, strengths, advice, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["telegram_id"],
+                mode,
+                result.get("rating", 0),
+                result.get("style_score", 0),
+                result.get("vibe", ""),
+                result.get("potential", ""),
+                result.get("summary", ""),
+                json.dumps(result.get("strengths", []), ensure_ascii=False),
+                json.dumps(result.get("advice", []), ensure_ascii=False),
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        conn.commit()
+        _close(conn)
 
-            conn = get_conn()
-            conn.execute(
-                """
-                INSERT INTO analyses
-                    (telegram_id, mode, rating, style_score, vibe, potential,
-                     summary, strengths, advice, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user["telegram_id"],
-                    mode,
-                    result.get("rating", 0),
-                    result.get("style_score", 0),
-                    result.get("vibe", ""),
-                    result.get("potential", ""),
-                    result.get("summary", ""),
-                    json.dumps(result.get("strengths", []), ensure_ascii=False),
-                    json.dumps(result.get("advice", []), ensure_ascii=False),
-                    datetime.utcnow().isoformat(),
-                ),
-            )
-            conn.commit()
-            _close(conn)
+        stats = get_stats(user["telegram_id"])
+        new_badges = sync_badges(user["telegram_id"], stats)
 
-            stats = get_stats(user["telegram_id"])
-            new_badges = sync_badges(user["telegram_id"], stats)
-
-            result["streak"] = stats["streak"]
-            result["total_analyses"] = stats["total"]
-            result["new_badges"] = new_badges
+        result["streak"] = stats["streak"]
+        result["total_analyses"] = stats["total"]
+        result["new_badges"] = new_badges
+        result["credits_left"] = get_credits(user["telegram_id"])
+        result["used_free_trial"] = reason == "free"
 
         return result
 
@@ -666,6 +817,8 @@ def profile(init_data: str = Query(...)):
         "username": user["username"],
         "photo_url": user["photo_url"],
         "leaderboard_opt_in": bool(user["leaderboard_opt_in"]),
+        "credits": user["credits"],
+        "free_used": bool(user["free_used"]),
         "stats": stats,
         "badges": badges,
     }
@@ -782,6 +935,70 @@ def referral(init_data: str = Form(...), referred_by: int = Form(...)):
 
 
 # ==========================
+# API — ОПЛАТА (Telegram Stars)
+# ==========================
+
+@app.get("/packages")
+def packages():
+    return {
+        "items": [
+            {"id": key, "credits": p["credits"], "stars": p["stars"], "title": p["title"]}
+            for key, p in STAR_PACKAGES.items()
+        ]
+    }
+
+
+@app.post("/create_invoice")
+def create_invoice(init_data: str = Form(...), package: str = Form(...)):
+    user_info = verify_init_data(init_data)
+    if not user_info:
+        return {"error": True, "message": "⚠️ Не удалось подтвердить пользователя Telegram."}
+
+    pkg = STAR_PACKAGES.get(package)
+    if not pkg:
+        return {"error": True, "message": "Неизвестный пакет."}
+
+    if not TELEGRAM_API_BASE:
+        return {
+            "error": True,
+            "message": "⚠️ Оплата временно недоступна (на сервере не настроен BOT_TOKEN).",
+        }
+
+    payload = json.dumps(
+        {"telegram_id": user_info["id"], "credits": pkg["credits"], "package": package}
+    )
+
+    body = json.dumps(
+        {
+            "title": pkg["title"],
+            "description": pkg["description"],
+            "payload": payload,
+            "currency": "XTR",
+            "prices": [{"label": pkg["title"], "amount": pkg["stars"]}],
+        }
+    ).encode()
+
+    req = urllib.request.Request(
+        f"{TELEGRAM_API_BASE}/createInvoiceLink",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        print("createInvoiceLink error:", e)
+        return {"error": True, "message": "⚠️ Не удалось создать счёт для оплаты."}
+
+    if not data.get("ok"):
+        return {"error": True, "message": data.get("description", "Ошибка Telegram API")}
+
+    return {"invoice_link": data["result"]}
+
+
+# ==========================
 # CHECK SERVER
 # ==========================
 
@@ -791,5 +1008,5 @@ def root():
         "status": "ok",
         "model": MODEL_NAME,
         "database": "turso" if USING_TURSO else "local-sqlite",
-        "features": ["analyze", "history", "profile", "leaderboard", "referral"],
+        "features": ["analyze", "history", "profile", "leaderboard", "referral", "payments"],
     }
