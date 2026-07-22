@@ -23,6 +23,29 @@ load_dotenv()
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # тот же токен, что и в bot.py; нужен для проверки подписи initData
 
+# Аккаунты без ограничений (пробная попытка/оплата их не касаются).
+# В .env: ADMIN_USERNAMES=shwimeen,another_username (без @, через запятую)
+# и/или ADMIN_TELEGRAM_IDS=123456789,987654321 (числовые id, надёжнее — username можно сменить)
+ADMIN_USERNAMES = {
+    u.strip().lstrip("@").lower()
+    for u in os.getenv("ADMIN_USERNAMES", "").split(",")
+    if u.strip()
+}
+ADMIN_TELEGRAM_IDS = {
+    int(i.strip())
+    for i in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",")
+    if i.strip().isdigit()
+}
+
+
+def is_admin(user_info):
+    if not user_info:
+        return False
+    if user_info.get("id") in ADMIN_TELEGRAM_IDS:
+        return True
+    username = (user_info.get("username") or "").lower()
+    return bool(username) and username in ADMIN_USERNAMES
+
 client = genai.Client(api_key=GEMINI_KEY)
 
 MODEL_NAME = "gemini-2.5-flash-lite"
@@ -386,6 +409,9 @@ def get_access_status(telegram_id):
 
 def consume_access(telegram_id, reason):
     """Списывает пробную попытку или один кредит. Вызывать ТОЛЬКО после успешного анализа."""
+    if reason == "admin":
+        return  # у админов ничего не списываем
+
     conn = get_conn()
 
     if reason == "free":
@@ -713,7 +739,11 @@ async def analyze(
 
     user = get_or_create_user(user_info)
 
-    allowed, reason = get_access_status(user["telegram_id"])
+    if is_admin(user_info):
+        allowed, reason = True, "admin"
+    else:
+        allowed, reason = get_access_status(user["telegram_id"])
+
     if not allowed:
         return {
             "error": True,
