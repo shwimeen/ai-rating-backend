@@ -156,6 +156,9 @@ def init_db():
             mode TEXT,
             rating REAL,
             style_score REAL,
+            symmetry_score REAL,
+            harmony_score REAL,
+            dimorphism_score REAL,
             vibe TEXT,
             potential TEXT,
             summary TEXT,
@@ -165,6 +168,18 @@ def init_db():
         )
         """
     )
+
+    # Миграция для баз, созданных до введения новых метрик.
+    for alter_sql in (
+        "ALTER TABLE analyses ADD COLUMN symmetry_score REAL",
+        "ALTER TABLE analyses ADD COLUMN harmony_score REAL",
+        "ALTER TABLE analyses ADD COLUMN dimorphism_score REAL",
+    ):
+        try:
+            conn.execute(alter_sql)
+            conn.commit()
+        except Exception:
+            pass
 
     conn.execute(
         """
@@ -426,6 +441,8 @@ BADGES = [
     {"id": "streak_7", "emoji": "🏆", "name": "Неделя подряд", "check": lambda s: s["streak"] >= 7},
     {"id": "high_score", "emoji": "🌟", "name": "Топ 9+", "check": lambda s: s["best_rating"] >= 9},
     {"id": "style_icon", "emoji": "🕶️", "name": "Икона стиля", "check": lambda s: s["best_style"] >= 9},
+    {"id": "symmetry_master", "emoji": "🔮", "name": "Идеальная симметрия", "check": lambda s: s["best_symmetry"] >= 9},
+    {"id": "golden_ratio", "emoji": "📐", "name": "Золотое сечение", "check": lambda s: s["best_harmony"] >= 9},
     {"id": "inviter", "emoji": "🤝", "name": "Первый друг", "check": lambda s: s["referral_count"] >= 1},
     {"id": "inviter5", "emoji": "📣", "name": "Амбассадор", "check": lambda s: s["referral_count"] >= 5},
 ]
@@ -436,12 +453,13 @@ def get_stats(telegram_id):
 
     cur = conn.execute(
         """
-        SELECT COUNT(*), COALESCE(MAX(rating), 0), COALESCE(MAX(style_score), 0)
+        SELECT COUNT(*), COALESCE(MAX(rating), 0), COALESCE(MAX(style_score), 0),
+               COALESCE(MAX(symmetry_score), 0), COALESCE(MAX(harmony_score), 0)
         FROM analyses WHERE telegram_id = ?
         """,
         (telegram_id,),
     )
-    total, best_rating, best_style = cur.fetchone()
+    total, best_rating, best_style, best_symmetry, best_harmony = cur.fetchone()
 
     cur2 = conn.execute(
         "SELECT referral_count FROM users WHERE telegram_id = ?", (telegram_id,)
@@ -454,6 +472,8 @@ def get_stats(telegram_id):
         "total": total or 0,
         "best_rating": best_rating or 0,
         "best_style": best_style or 0,
+        "best_symmetry": best_symmetry or 0,
+        "best_harmony": best_harmony or 0,
         "referral_count": user_row[0] if user_row else 0,
         "streak": compute_streak(telegram_id),
     }
@@ -532,6 +552,9 @@ RESPONSE_SCHEMA = {
         "face_visible": {"type": "boolean"},
         "rating": {"type": "number"},
         "style_score": {"type": "number"},
+        "symmetry_score": {"type": "number"},
+        "harmony_score": {"type": "number"},
+        "dimorphism_score": {"type": "number"},
         "vibe": {"type": "string"},
         "potential": {"type": "string"},
         "strengths": {"type": "array", "items": {"type": "string"}},
@@ -542,6 +565,9 @@ RESPONSE_SCHEMA = {
         "face_visible",
         "rating",
         "style_score",
+        "symmetry_score",
+        "harmony_score",
+        "dimorphism_score",
         "vibe",
         "potential",
         "strengths",
@@ -558,6 +584,24 @@ RESPONSE_SCHEMA = {
 def analyze_image(image_path, mode_key, profile):
 
     mode_desc = MODES.get(mode_key, MODES["general"])
+
+    dimorphism_desc = {
+        "male": (
+            "dimorphism_score — выраженность маскулинных черт лица (широкая нижняя "
+            "челюсть, выраженные надбровные дуги, скулы, тяжёлый подбородок): "
+            "10.0 — максимально маскулинное лицо, 1.0 — минимально маскулинное"
+        ),
+        "female": (
+            "dimorphism_score — выраженность женственных черт лица (мягкие линии, "
+            "полные губы, тонкие брови, узкий подбородок, гладкий контур): "
+            "10.0 — максимально женственное лицо, 1.0 — минимально женственное"
+        ),
+        "general": (
+            "dimorphism_score — насколько ярко лицо тяготеет к типично мужским или "
+            "женским чертам (не важно, к каким именно): 10.0 — черты ярко выражены "
+            "и контрастны, 1.0 — черты нейтральные, андрогинные"
+        ),
+    }.get(mode_key, "dimorphism_score — выраженность гендерных черт лица от 1.0 до 10.0")
 
     profile_line = ""
 
@@ -577,7 +621,7 @@ def analyze_image(image_path, mode_key, profile):
             profile_line = "Дополнительный контекст: " + ", ".join(parts)
 
     prompt = (
-        "Ты — строгий эксперт по анализу фотографий. "
+        "Ты — строгий эксперт по анализу фотографий (в том числе антропометрии лица). "
         "ШАГ 1 (обязательный, выполняется первым): проверь изображение и определи, "
         "есть ли на нём настоящее человеческое лицо, которое хорошо и чётко видно. "
         "Установи face_visible=false, если выполняется хотя бы одно условие: "
@@ -586,7 +630,8 @@ def analyze_image(image_path, mode_key, profile):
         "лицо отсутствует в кадре, лицо слишком маленькое или размытое, "
         "лицо закрыто маской, руками или иным объектом, "
         "либо человек повернут спиной/затылком к камере. "
-        "В этом случае rating=0, style_score=0, vibe и potential — пустые строки, "
+        "В этом случае rating=0, style_score=0, symmetry_score=0, harmony_score=0, "
+        "dimorphism_score=0, vibe и potential — пустые строки, "
         "strengths и advice — пустые массивы, summary — пустая строка. "
         "ШАГ 2: только если лицо реально видно и его можно оценить, установи face_visible=true "
         "и продолжи анализ. "
@@ -596,12 +641,21 @@ def analyze_image(image_path, mode_key, profile):
         "Если face_visible=true, заполни: "
         "rating — общая оценка внешности от 1.0 до 10.0 с одной цифрой после запятой; "
         "style_score — отдельная оценка стиля, подачи и ухоженности от 1.0 до 10.0; "
+        "symmetry_score — оценка симметрии лица (левая половина против правой: "
+        "положение глаз, бровей, уголков рта, центровка носа) от 1.0 до 10.0, "
+        "10.0 — идеально симметрично; "
+        "harmony_score — гармоничность и сбалансированность пропорций лица (баланс "
+        "между лбом, носом, подбородком, расстояние между чертами, близость к "
+        "классическим пропорциям) от 1.0 до 10.0; "
+        f"{dimorphism_desc}; "
         "vibe — короткая фраза из 2-4 слов, описывающая ауру/энергетику человека "
         "(например: 'уверенный минимализм', 'дерзкая харизма'); "
         "potential — одно короткое предложение о том, что сильнее всего повысит оценку; "
         "strengths — список конкретных сильных сторон; "
         "advice — список конкретных советов (волосы, кожа, стиль, одежда, поза, освещение); "
         "summary — краткое резюме на 1-2 предложения. "
+        "Все метрики независимы друг от друга и оцениваются по-разному — не копируй "
+        "одно и то же число между полями. "
         "Оценивай только то, что реально видно на фотографии. Будь реалистичен и справедлив."
     )
 
@@ -720,15 +774,18 @@ async def analyze(
         conn.execute(
             """
             INSERT INTO analyses
-                (telegram_id, mode, rating, style_score, vibe, potential,
-                 summary, strengths, advice, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (telegram_id, mode, rating, style_score, symmetry_score, harmony_score,
+                 dimorphism_score, vibe, potential, summary, strengths, advice, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user["telegram_id"],
                 mode,
                 result.get("rating", 0),
                 result.get("style_score", 0),
+                result.get("symmetry_score", 0),
+                result.get("harmony_score", 0),
+                result.get("dimorphism_score", 0),
                 result.get("vibe", ""),
                 result.get("potential", ""),
                 result.get("summary", ""),
@@ -748,6 +805,7 @@ async def analyze(
         result["new_badges"] = new_badges
         result["credits_left"] = get_credits(user["telegram_id"])
         result["used_free_trial"] = reason == "free"
+        result["mode"] = mode
 
         return result
 
@@ -769,8 +827,8 @@ def history(init_data: str = Query(...), limit: int = 20):
     conn = get_conn()
     cur = conn.execute(
         """
-        SELECT id, mode, rating, style_score, vibe, potential, summary,
-               strengths, advice, created_at
+        SELECT id, mode, rating, style_score, symmetry_score, harmony_score,
+               dimorphism_score, vibe, potential, summary, strengths, advice, created_at
         FROM analyses WHERE telegram_id = ?
         ORDER BY created_at DESC LIMIT ?
         """,
@@ -785,12 +843,15 @@ def history(init_data: str = Query(...), limit: int = 20):
             "mode": r[1],
             "rating": r[2],
             "style_score": r[3],
-            "vibe": r[4],
-            "potential": r[5],
-            "summary": r[6],
-            "strengths": json.loads(r[7] or "[]"),
-            "advice": json.loads(r[8] or "[]"),
-            "created_at": r[9],
+            "symmetry_score": r[4],
+            "harmony_score": r[5],
+            "dimorphism_score": r[6],
+            "vibe": r[7],
+            "potential": r[8],
+            "summary": r[9],
+            "strengths": json.loads(r[10] or "[]"),
+            "advice": json.loads(r[11] or "[]"),
+            "created_at": r[12],
         }
         for r in rows
     ]
