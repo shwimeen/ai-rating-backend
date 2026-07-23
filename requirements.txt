@@ -5,3 +5,4 @@ python-dotenv
 google-genai
 python-telegram-bot
 libsql
+Pillow

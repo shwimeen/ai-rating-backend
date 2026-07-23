@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import time
 import hmac
@@ -6,12 +7,16 @@ import hashlib
 import sqlite3
 import urllib.parse
 import urllib.request
+import threading
+from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
 
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+from PIL import Image
 
 from google import genai
 from google.genai import types
@@ -49,6 +54,70 @@ def is_admin(user_info):
 client = genai.Client(api_key=GEMINI_KEY)
 
 MODEL_NAME = "gemini-2.5-flash-lite"
+
+# ==========================
+# ЛИМИТЫ ФОТО (размер + сжатие)
+# ==========================
+
+MAX_UPLOAD_MB = 10
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_IMAGE_DIMENSION = 1600  # px по большей стороне — этого более чем достаточно для анализа лица
+
+
+def compress_image(raw_bytes: bytes) -> bytes:
+    """
+    Уменьшает фото до разумного размера перед отправкой в Gemini:
+    - сжимает сторону до MAX_IMAGE_DIMENSION px,
+    - перекодирует в JPEG с качеством 85.
+    Это ускоряет анализ и экономит трафик/токены. Если что-то пошло не так
+    при обработке — просто используем исходные байты как есть.
+    """
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        img = img.convert("RGB")
+
+        w, h = img.size
+        if max(w, h) > MAX_IMAGE_DIMENSION:
+            scale = MAX_IMAGE_DIMENSION / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+        return buf.getvalue()
+    except Exception as e:
+        print("Ошибка сжатия изображения:", e)
+        return raw_bytes
+
+
+# ==========================
+# РЕЙТ-ЛИМИТ (защита от спама)
+# ==========================
+#
+# Простой in-memory лимитер: не больше RATE_LIMIT_MAX анализов за
+# RATE_LIMIT_WINDOW секунд на одного пользователя. Работает корректно при
+# ОДНОМ воркере (WEB_CONCURRENCY=1, как сейчас на Render) — если в будущем
+# перейдёшь на несколько воркеров/инстансов, лимит нужно будет переносить
+# в общее хранилище (например, в ту же Turso-базу или Redis), иначе у
+# каждого воркера будет свой независимый счётчик.
+
+RATE_LIMIT_MAX = 5
+RATE_LIMIT_WINDOW = 60  # секунд
+
+_rate_limit_lock = threading.Lock()
+_rate_limit_log = defaultdict(deque)
+
+
+def check_rate_limit(telegram_id):
+    """True — можно продолжать, False — превышен лимит запросов в минуту."""
+    now = time.time()
+    with _rate_limit_lock:
+        dq = _rate_limit_log[telegram_id]
+        while dq and now - dq[0] > RATE_LIMIT_WINDOW:
+            dq.popleft()
+        if len(dq) >= RATE_LIMIT_MAX:
+            return False
+        dq.append(now)
+        return True
 
 # ==========================
 # ОПЛАТА (Telegram Stars)
@@ -857,15 +926,34 @@ async def analyze(
             "message": "🔒 Бесплатная попытка уже использована. Пополни баланс, чтобы продолжить.",
         }
 
+    if not is_admin(user_info) and not check_rate_limit(user["telegram_id"]):
+        return {
+            "error": True,
+            "message": f"⏳ Слишком много запросов подряд. Подожди немного и попробуй снова "
+            f"(лимит: {RATE_LIMIT_MAX} анализов в минуту).",
+        }
+
+    raw_front = await photo_front.read()
+    raw_profile = await photo_profile.read()
+
+    if len(raw_front) > MAX_UPLOAD_BYTES or len(raw_profile) > MAX_UPLOAD_BYTES:
+        return {
+            "error": True,
+            "message": f"⚠️ Файл слишком большой. Максимум {MAX_UPLOAD_MB} МБ на одно фото.",
+        }
+
+    raw_front = compress_image(raw_front)
+    raw_profile = compress_image(raw_profile)
+
     ts = int(time.time() * 1000)
     front_temp = f"temp_front_{ts}.jpg"
     profile_temp = f"temp_profile_{ts}.jpg"
 
     with open(front_temp, "wb") as f:
-        f.write(await photo_front.read())
+        f.write(raw_front)
 
     with open(profile_temp, "wb") as f:
-        f.write(await photo_profile.read())
+        f.write(raw_profile)
 
     profile = {"age": age, "height": height, "weight": weight}
 
@@ -887,14 +975,14 @@ async def analyze(
                 else:
                     return {
                         "error": True,
-                        "message": "⚠️ AI перегружен. Попробуйте позже.",
+                        "message": "🚧 Сервер перегружен. Попробуйте через несколько минут.",
                     }
 
             except ClientError as e:
                 print("Gemini API ошибка:", e)
                 return {
                     "error": True,
-                    "message": "⚠️ Лимит AI запросов закончился.",
+                    "message": "🚧 Достигнут дневной лимит запросов к AI. Попробуйте позже.",
                 }
 
             except Exception as e:
