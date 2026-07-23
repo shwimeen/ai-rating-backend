@@ -55,7 +55,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-WEBAPP_URL = "https://shwimeen.github.io/ai-rating-webapp/?v=5"
+WEBAPP_URL = "https://shwimeen.github.io/ai-rating-webapp/?v=6"
 
 
 # ==========================
