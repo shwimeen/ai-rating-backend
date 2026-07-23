@@ -195,8 +195,19 @@ def init_db():
     # Миграция для баз, созданных до введения новых метрик.
     for alter_sql in (
         "ALTER TABLE analyses ADD COLUMN symmetry_score REAL",
-        "ALTER TABLE analyses ADD COLUMN harmony_score REAL",
+        "ALTER TABLE analyses ADD COLUMN harmony_score REAL",  # старое имя, оставлено для истории
         "ALTER TABLE analyses ADD COLUMN dimorphism_score REAL",
+        "ALTER TABLE analyses ADD COLUMN proportions_score REAL",
+        "ALTER TABLE analyses ADD COLUMN jawline_score REAL",
+        "ALTER TABLE analyses ADD COLUMN chin_score REAL",
+        "ALTER TABLE analyses ADD COLUMN eyes_score REAL",
+        "ALTER TABLE analyses ADD COLUMN nose_score REAL",
+        "ALTER TABLE analyses ADD COLUMN lips_score REAL",
+        "ALTER TABLE analyses ADD COLUMN skin_score REAL",
+        "ALTER TABLE analyses ADD COLUMN hair_score REAL",
+        "ALTER TABLE analyses ADD COLUMN expression_score REAL",
+        "ALTER TABLE analyses ADD COLUMN photo_quality_score REAL",
+        "ALTER TABLE analyses ADD COLUMN body_fat_percent REAL",
     ):
         try:
             conn.execute(alter_sql)
@@ -469,6 +480,8 @@ BADGES = [
     {"id": "style_icon", "emoji": "🕶️", "name": "Икона стиля", "check": lambda s: s["best_style"] >= 9},
     {"id": "symmetry_master", "emoji": "🔮", "name": "Идеальная симметрия", "check": lambda s: s["best_symmetry"] >= 9},
     {"id": "golden_ratio", "emoji": "📐", "name": "Золотое сечение", "check": lambda s: s["best_harmony"] >= 9},
+    {"id": "sharp_jawline", "emoji": "🦴", "name": "Чёткая челюсть", "check": lambda s: s["best_jawline"] >= 9},
+    {"id": "clear_skin", "emoji": "🧴", "name": "Чистая кожа", "check": lambda s: s["best_skin"] >= 9},
     {"id": "inviter", "emoji": "🤝", "name": "Первый друг", "check": lambda s: s["referral_count"] >= 1},
     {"id": "inviter5", "emoji": "📣", "name": "Амбассадор", "check": lambda s: s["referral_count"] >= 5},
 ]
@@ -480,12 +493,13 @@ def get_stats(telegram_id):
     cur = conn.execute(
         """
         SELECT COUNT(*), COALESCE(MAX(rating), 0), COALESCE(MAX(style_score), 0),
-               COALESCE(MAX(symmetry_score), 0), COALESCE(MAX(harmony_score), 0)
+               COALESCE(MAX(symmetry_score), 0), COALESCE(MAX(proportions_score), 0),
+               COALESCE(MAX(jawline_score), 0), COALESCE(MAX(skin_score), 0)
         FROM analyses WHERE telegram_id = ?
         """,
         (telegram_id,),
     )
-    total, best_rating, best_style, best_symmetry, best_harmony = cur.fetchone()
+    total, best_rating, best_style, best_symmetry, best_proportions, best_jawline, best_skin = cur.fetchone()
 
     cur2 = conn.execute(
         "SELECT referral_count FROM users WHERE telegram_id = ?", (telegram_id,)
@@ -499,7 +513,9 @@ def get_stats(telegram_id):
         "best_rating": best_rating or 0,
         "best_style": best_style or 0,
         "best_symmetry": best_symmetry or 0,
-        "best_harmony": best_harmony or 0,
+        "best_harmony": best_proportions or 0,  # имя ключа сохранено для совместимости бейджей
+        "best_jawline": best_jawline or 0,
+        "best_skin": best_skin or 0,
         "referral_count": user_row[0] if user_row else 0,
         "streak": compute_streak(telegram_id),
     }
@@ -576,11 +592,25 @@ RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
         "face_visible": {"type": "boolean"},
+        # --- основные критерии (по запросу пользователя) ---
         "rating": {"type": "number"},
-        "style_score": {"type": "number"},
         "symmetry_score": {"type": "number"},
-        "harmony_score": {"type": "number"},
+        "proportions_score": {"type": "number"},
+        "jawline_score": {"type": "number"},
+        "chin_score": {"type": "number"},
+        "eyes_score": {"type": "number"},
+        "nose_score": {"type": "number"},
+        "lips_score": {"type": "number"},
+        "skin_score": {"type": "number"},
+        "hair_score": {"type": "number"},
+        "expression_score": {"type": "number"},
+        "photo_quality_score": {"type": "number"},
+        # --- lookmaxing ---
+        "body_fat_percent": {"type": "number"},
+        # --- бонусные метрики (были и раньше) ---
+        "style_score": {"type": "number"},
         "dimorphism_score": {"type": "number"},
+        # --- текстовая часть ---
         "vibe": {"type": "string"},
         "potential": {"type": "string"},
         "strengths": {"type": "array", "items": {"type": "string"}},
@@ -590,9 +620,19 @@ RESPONSE_SCHEMA = {
     "required": [
         "face_visible",
         "rating",
-        "style_score",
         "symmetry_score",
-        "harmony_score",
+        "proportions_score",
+        "jawline_score",
+        "chin_score",
+        "eyes_score",
+        "nose_score",
+        "lips_score",
+        "skin_score",
+        "hair_score",
+        "expression_score",
+        "photo_quality_score",
+        "body_fat_percent",
+        "style_score",
         "dimorphism_score",
         "vibe",
         "potential",
@@ -602,12 +642,50 @@ RESPONSE_SCHEMA = {
     ],
 }
 
+# Порядок и подписи для UI (таблица критериев) — единый источник правды,
+# фронтенд получает их через /criteria, чтобы подписи не разъезжались.
+CRITERIA_GROUPS = [
+    {
+        "id": "main",
+        "title": "📊 Основные критерии",
+        "items": [
+            {"key": "rating", "emoji": "⭐", "label": "Общая привлекательность"},
+            {"key": "symmetry_score", "emoji": "😊", "label": "Симметрия лица"},
+            {"key": "proportions_score", "emoji": "📐", "label": "Пропорции лица"},
+            {"key": "jawline_score", "emoji": "🦴", "label": "Линия челюсти"},
+            {"key": "chin_score", "emoji": "👤", "label": "Подбородок"},
+            {"key": "eyes_score", "emoji": "👀", "label": "Глаза"},
+            {"key": "nose_score", "emoji": "👃", "label": "Нос"},
+            {"key": "lips_score", "emoji": "👄", "label": "Губы"},
+            {"key": "skin_score", "emoji": "🧴", "label": "Кожа"},
+            {"key": "hair_score", "emoji": "💇", "label": "Волосы и причёска"},
+            {"key": "expression_score", "emoji": "😐", "label": "Выражение лица"},
+            {"key": "photo_quality_score", "emoji": "📸", "label": "Качество фотографии"},
+        ],
+    },
+    {
+        "id": "lookmax",
+        "title": "💪 Lookmaxing",
+        "items": [
+            {"key": "body_fat_percent", "emoji": "🏋️", "label": "Процент жира (оценочно)", "unit": "%"},
+        ],
+    },
+    {
+        "id": "bonus",
+        "title": "✨ Дополнительно",
+        "items": [
+            {"key": "style_score", "emoji": "💅", "label": "Стиль"},
+            {"key": "dimorphism_score", "emoji": "⚖️", "label": "Диморфизм"},
+        ],
+    },
+]
+
 
 # ==========================
 # GEMINI ANALYSIS
 # ==========================
 
-def analyze_image(image_path, mode_key, profile):
+def analyze_image(front_path, profile_path, mode_key, profile):
 
     mode_desc = MODES.get(mode_key, MODES["general"])
 
@@ -646,51 +724,78 @@ def analyze_image(image_path, mode_key, profile):
         if parts:
             profile_line = "Дополнительный контекст: " + ", ".join(parts)
 
+    zero_fields = (
+        "rating=0, symmetry_score=0, proportions_score=0, jawline_score=0, chin_score=0, "
+        "eyes_score=0, nose_score=0, lips_score=0, skin_score=0, hair_score=0, "
+        "expression_score=0, photo_quality_score=0, body_fat_percent=0, style_score=0, "
+        "dimorphism_score=0"
+    )
+
     prompt = (
-        "Ты — строгий эксперт по анализу фотографий (в том числе антропометрии лица). "
-        "ШАГ 1 (обязательный, выполняется первым): проверь изображение и определи, "
-        "есть ли на нём настоящее человеческое лицо, которое хорошо и чётко видно. "
-        "Установи face_visible=false, если выполняется хотя бы одно условие: "
+        "Ты — строгий эксперт по анализу внешности и антропометрии лица. "
+        "Тебе присланы ДВЕ фотографии одного и того же человека: ПЕРВОЕ изображение — "
+        "фото анфас (лицом прямо к камере), ВТОРОЕ изображение — фото профиля (вид сбоку). "
+        "Используй анфас для оценки симметрии, глаз, губ, кожи, выражения лица; "
+        "используй профиль для оценки линии челюсти, подбородка, носа сбоку — эти черты "
+        "гораздо точнее видны в профиль. Остальные критерии оценивай, комбинируя оба фото. "
+        ""
+        "ШАГ 1 (обязательный, выполняется первым): проверь ОБА изображения и определи, "
+        "есть ли на них настоящее человеческое лицо, которое хорошо и чётко видно. "
+        "Установи face_visible=false, если хотя бы одно из двух фото не подходит: "
         "это скриншот игры, скриншот интерфейса или соцсети, мем, коллаж с текстом, "
         "рисунок или аватар, фотография предмета, животного или пейзажа без человека, "
         "лицо отсутствует в кадре, лицо слишком маленькое или размытое, "
-        "лицо закрыто маской, руками или иным объектом, "
-        "либо человек повернут спиной/затылком к камере. "
-        "В этом случае rating=0, style_score=0, symmetry_score=0, harmony_score=0, "
-        "dimorphism_score=0, vibe и potential — пустые строки, "
+        "лицо закрыто маской, руками или иным объектом. "
+        f"В этом случае {zero_fields}, vibe и potential — пустые строки, "
         "strengths и advice — пустые массивы, summary — пустая строка. "
-        "ШАГ 2: только если лицо реально видно и его можно оценить, установи face_visible=true "
+        ""
+        "ШАГ 2: только если на обоих фото лицо реально видно, установи face_visible=true "
         "и продолжи анализ. "
         f"Фокус анализа: {mode_desc}. "
         f"{profile_line} "
-        "Отвечай строго на русском языке, все поля JSON должны быть на русском. "
-        "Если face_visible=true, заполни: "
-        "rating — общая оценка внешности от 1.0 до 10.0 с одной цифрой после запятой; "
-        "style_score — отдельная оценка стиля, подачи и ухоженности от 1.0 до 10.0; "
-        "symmetry_score — оценка симметрии лица (левая половина против правой: "
-        "положение глаз, бровей, уголков рта, центровка носа) от 1.0 до 10.0, "
-        "10.0 — идеально симметрично; "
-        "harmony_score — гармоничность и сбалансированность пропорций лица (баланс "
-        "между лбом, носом, подбородком, расстояние между чертами, близость к "
-        "классическим пропорциям) от 1.0 до 10.0; "
+        "Отвечай строго на русском языке, все поля JSON — на русском. "
+        "Если face_visible=true, заполни (все оценки от 1.0 до 10.0 с одной цифрой после "
+        "запятой, независимо друг от друга — НЕ копируй одинаковые числа между полями): "
+        "rating — итоговая общая привлекательность; "
+        "symmetry_score — симметрия лица (левая половина против правой: положение глаз, "
+        "бровей, уголков рта, центровка носа), по фото анфас; "
+        "proportions_score — гармоничность пропорций (баланс лба/носа/подбородка, "
+        "расстояние между глазами, близость к классическим пропорциям); "
+        "jawline_score — чёткость и выраженность линии челюсти, оценивай ПРЕИМУЩЕСТВЕННО "
+        "по фото профиля; "
+        "chin_score — форма и размер подбородка, тоже ориентируйся на профиль; "
+        "eyes_score — форма, размер и выразительность глаз (по анфасу); "
+        "nose_score — гармоничность носа относительно остального лица (используй оба фото, "
+        "особенно профиль для оценки формы спинки носа); "
+        "lips_score — объём и симметрия губ; "
+        "skin_score — чистота кожи, наличие акне/покраснений/неровностей, текстура; "
+        "hair_score — состояние волос и насколько причёска подходит форме лица; "
+        "expression_score — естественность и расслабленность выражения лица на фото "
+        "(зажатость/улыбка/напряжение); "
+        "photo_quality_score — качество самих фотографий (освещение, ракурс, резкость, "
+        "разрешение) — это оценка фото, а не внешности человека; "
+        "body_fat_percent — ПРИМЕРНАЯ оценка процента жира в организме на основе черт "
+        "лица (чёткость скул/челюсти, полнота щёк, второй подбородок), реалистичное "
+        "число в диапазоне 5-40, это грубая прикидка, а не медицинское измерение; "
+        "style_score — оценка стиля, подачи и ухоженности; "
         f"{dimorphism_desc}; "
-        "vibe — короткая фраза из 2-4 слов, описывающая ауру/энергетику человека "
-        "(например: 'уверенный минимализм', 'дерзкая харизма'); "
+        "vibe — короткая фраза из 2-4 слов, описывающая ауру/энергетику человека; "
         "potential — одно короткое предложение о том, что сильнее всего повысит оценку; "
         "strengths — список конкретных сильных сторон; "
         "advice — список конкретных советов (волосы, кожа, стиль, одежда, поза, освещение); "
         "summary — краткое резюме на 1-2 предложения. "
-        "Все метрики независимы друг от друга и оцениваются по-разному — не копируй "
-        "одно и то же число между полями. "
-        "Оценивай только то, что реально видно на фотографии. Будь реалистичен и справедлив."
+        "Оценивай только то, что реально видно на фотографиях. Будь реалистичен и справедлив."
     )
 
-    with open(image_path, "rb") as image:
+    with open(front_path, "rb") as f_front, open(profile_path, "rb") as f_profile:
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=[
                 prompt,
-                types.Part.from_bytes(data=image.read(), mime_type="image/jpeg"),
+                "Фото 1 — АНФАС:",
+                types.Part.from_bytes(data=f_front.read(), mime_type="image/jpeg"),
+                "Фото 2 — ПРОФИЛЬ:",
+                types.Part.from_bytes(data=f_profile.read(), mime_type="image/jpeg"),
             ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -707,7 +812,7 @@ def analyze_image(image_path, mode_key, profile):
     if not data.get("face_visible"):
         return {
             "error": True,
-            "message": "❌ Лицо не обнаружено. Загрузите фото, где лицо хорошо видно.",
+            "message": "❌ Лицо не обнаружено хотя бы на одном фото. Загрузите два фото, где лицо хорошо видно.",
         }
 
     return data
@@ -719,7 +824,8 @@ def analyze_image(image_path, mode_key, profile):
 
 @app.post("/analyze")
 async def analyze(
-    photo: UploadFile = File(...),
+    photo_front: UploadFile = File(...),
+    photo_profile: UploadFile = File(...),
     mode: str = Form(...),
     age: str = Form(None),
     height: str = Form(None),
@@ -751,10 +857,15 @@ async def analyze(
             "message": "🔒 Бесплатная попытка уже использована. Пополни баланс, чтобы продолжить.",
         }
 
-    temp_file = f"temp_{int(time.time() * 1000)}.jpg"
+    ts = int(time.time() * 1000)
+    front_temp = f"temp_front_{ts}.jpg"
+    profile_temp = f"temp_profile_{ts}.jpg"
 
-    with open(temp_file, "wb") as f:
-        f.write(await photo.read())
+    with open(front_temp, "wb") as f:
+        f.write(await photo_front.read())
+
+    with open(profile_temp, "wb") as f:
+        f.write(await photo_profile.read())
 
     profile = {"age": age, "height": height, "weight": weight}
 
@@ -764,7 +875,7 @@ async def analyze(
         for attempt in range(3):
             try:
                 print(f"Gemini попытка {attempt + 1}/3")
-                result = analyze_image(temp_file, mode, profile)
+                result = analyze_image(front_temp, profile_temp, mode, profile)
                 print("Анализ успешный")
                 break
 
@@ -804,9 +915,11 @@ async def analyze(
         conn.execute(
             """
             INSERT INTO analyses
-                (telegram_id, mode, rating, style_score, symmetry_score, harmony_score,
+                (telegram_id, mode, rating, style_score, symmetry_score, proportions_score,
+                 jawline_score, chin_score, eyes_score, nose_score, lips_score, skin_score,
+                 hair_score, expression_score, photo_quality_score, body_fat_percent,
                  dimorphism_score, vibe, potential, summary, strengths, advice, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user["telegram_id"],
@@ -814,7 +927,17 @@ async def analyze(
                 result.get("rating", 0),
                 result.get("style_score", 0),
                 result.get("symmetry_score", 0),
-                result.get("harmony_score", 0),
+                result.get("proportions_score", 0),
+                result.get("jawline_score", 0),
+                result.get("chin_score", 0),
+                result.get("eyes_score", 0),
+                result.get("nose_score", 0),
+                result.get("lips_score", 0),
+                result.get("skin_score", 0),
+                result.get("hair_score", 0),
+                result.get("expression_score", 0),
+                result.get("photo_quality_score", 0),
+                result.get("body_fat_percent", 0),
                 result.get("dimorphism_score", 0),
                 result.get("vibe", ""),
                 result.get("potential", ""),
@@ -840,8 +963,9 @@ async def analyze(
         return result
 
     finally:
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
+        for f in (front_temp, profile_temp):
+            if os.path.exists(f):
+                os.remove(f)
 
 
 # ==========================
@@ -857,7 +981,9 @@ def history(init_data: str = Query(...), limit: int = 20):
     conn = get_conn()
     cur = conn.execute(
         """
-        SELECT id, mode, rating, style_score, symmetry_score, harmony_score,
+        SELECT id, mode, rating, style_score, symmetry_score, proportions_score,
+               jawline_score, chin_score, eyes_score, nose_score, lips_score, skin_score,
+               hair_score, expression_score, photo_quality_score, body_fat_percent,
                dimorphism_score, vibe, potential, summary, strengths, advice, created_at
         FROM analyses WHERE telegram_id = ?
         ORDER BY created_at DESC LIMIT ?
@@ -874,19 +1000,35 @@ def history(init_data: str = Query(...), limit: int = 20):
             "rating": r[2],
             "style_score": r[3],
             "symmetry_score": r[4],
-            "harmony_score": r[5],
-            "dimorphism_score": r[6],
-            "vibe": r[7],
-            "potential": r[8],
-            "summary": r[9],
-            "strengths": json.loads(r[10] or "[]"),
-            "advice": json.loads(r[11] or "[]"),
-            "created_at": r[12],
+            "proportions_score": r[5],
+            "jawline_score": r[6],
+            "chin_score": r[7],
+            "eyes_score": r[8],
+            "nose_score": r[9],
+            "lips_score": r[10],
+            "skin_score": r[11],
+            "hair_score": r[12],
+            "expression_score": r[13],
+            "photo_quality_score": r[14],
+            "body_fat_percent": r[15],
+            "dimorphism_score": r[16],
+            "vibe": r[17],
+            "potential": r[18],
+            "summary": r[19],
+            "strengths": json.loads(r[20] or "[]"),
+            "advice": json.loads(r[21] or "[]"),
+            "created_at": r[22],
         }
         for r in rows
     ]
 
     return {"items": items}
+
+
+@app.get("/criteria")
+def criteria():
+    """Единый источник правды для подписей/эмодзи критериев — фронтенд строит по этому таблицу."""
+    return {"groups": CRITERIA_GROUPS}
 
 
 # ==========================
